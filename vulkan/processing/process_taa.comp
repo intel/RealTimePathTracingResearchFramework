@@ -1,0 +1,111 @@
+// Copyright 2023 Intel Corporation.
+// SPDX-License-Identifier: MIT
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "defaults.glsl"
+#include "../gpu_params.glsl"
+
+layout(local_size_x=WORKGROUP_SIZE_X, local_size_y=WORKGROUP_SIZE_Y) in;
+#include "../setup_pixel_assignment.glsl"
+
+layout(binding = FRAMEBUFFER_BIND_POINT, set = 0, rgba8) uniform image2D framebuffer;
+layout(binding = HISTORY_FRAMEBUFFER_BIND_POINT, set = 0) uniform sampler2D history_framebuffer;
+
+#ifdef ENABLE_AOV_BUFFERS
+layout(binding = AOV_ALBEDO_ROUGHNESS_BIND_POINT, set = 0, rgba16f) uniform image2D aov_albedo_roughness_buffer;
+layout(binding = AOV_NORMAL_DEPTH_BIND_POINT, set = 0, rgba16f) uniform image2D aov_normal_depth_buffer;
+layout(binding = AOV_MOTION_JITTER_BIND_POINT, set = 0, rgba16f) uniform image2D aov_motion_jitter_buffer;
+#endif
+
+layout(push_constant) uniform PushConstants {
+    ivec2 fb_dims;
+    int render_upscale_factor;
+    int _pad;
+};
+
+float lanczosWeight(float x, float r) {
+    if (x == 0.0) return 1.0f;
+    return r * sin(x * M_PI) * sin((x / r) * M_PI) / (M_PI * M_PI * x * x);
+}
+float lanczosWeight(vec2 x, float r) {
+    return lanczosWeight(x.x, r) * lanczosWeight(x.y, r);
+}
+vec4 lanczos(vec2 coord, int r) {
+    vec2 point = coord * fb_dims - vec2(0.5);
+    vec2 cpoint = ceil(point);
+
+    vec4 accum  = vec4(0.0f);
+    float total = 0.0f;
+    for (ivec2 o = ivec2(-r); o.y < r; ++o.y)
+        for (o.x = -r; o.x < r; ++o.x) {
+            vec2 npoint  = vec2(render_upscale_factor*o) + cpoint;
+            float weight = lanczosWeight((npoint - point) / render_upscale_factor, float(r));
+
+            accum += weight * texelFetch(history_framebuffer, ivec2(npoint), 0);
+            total += weight;
+        }
+
+    return accum / total;
+}
+
+void main() {
+    ivec2 fb_pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (fb_pixel.x >= fb_dims.x || fb_pixel.y >= fb_dims.y)
+        return;
+
+    vec4 accum_color = imageLoad(framebuffer, fb_pixel);
+
+#ifdef ENABLE_AOV_BUFFERS
+    vec2 motion = imageLoad(aov_motion_jitter_buffer, fb_pixel / render_upscale_factor).xy;
+    float motion_len = dot(motion, motion);
+    for (ivec2 o = ivec2(-1); o.y <= 1; ++o.y)
+        for (o.x = -1; o.x <= 1; ++o.x) {
+            vec2 m = imageLoad(aov_motion_jitter_buffer, fb_pixel / render_upscale_factor).xy;
+            float ml = dot(m, m);
+            if (ml > motion_len) {
+                motion = m;
+                motion_len = ml;
+            }
+        }
+    motion_len = length(0.5f * motion * vec2(fb_dims));
+
+    vec2 starting_point = (vec2(fb_pixel) + vec2(0.5f)) / vec2(fb_dims);
+    vec2 reconstruction_point = starting_point + 0.5f * motion;
+
+    vec4 history_color = vec4(0.0f);
+    float new_sample_weight = 1.0f;
+    if (reconstruction_point.x >= 0.0f && reconstruction_point.y >= 0.0f &&
+        reconstruction_point.x <= 1.0f && reconstruction_point.y <= 1.0f) {
+        //history_color = textureLod(history_framebuffer, reconstruction_point, 0.0f);
+        history_color = lanczos(reconstruction_point, 5);
+        new_sample_weight = 0.15f;
+    }
+
+    vec4 trim = vec4(0.0f);
+    if (new_sample_weight < 1.0f) {
+        vec4 max2 = vec4(0.0f);
+        for (ivec2 o = ivec2(-1); o.y <= 1; ++o.y)
+            for (o.x = -1; o.x <= 1; ++o.x) {
+                vec4 val = imageLoad(framebuffer, fb_pixel + o * render_upscale_factor);
+                trim += val;
+                max2 += val * val;
+            }
+        trim /= 9.0f;
+        max2 /= 9.0f;
+        max2 = sqrt(max2);
+        vec4 stddev = 9.0f / 8.0f * (max2 - trim);
+
+        vec4 trim_low = max(vec4(0.0f), trim - stddev);
+        vec4 trim_high = max(trim + 3.0f * stddev, accum_color + stddev);
+
+        accum_color = history_color + (accum_color - history_color) * new_sample_weight;
+        accum_color = clamp(accum_color, trim_low, trim_high);
+        //accum_color = trim_high;
+    }
+
+#endif
+
+    imageStore(framebuffer, fb_pixel, accum_color);
+}

@@ -1,0 +1,200 @@
+// Copyright 2023 Intel Corporation.
+// SPDX-License-Identifier: MIT
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "language.glsl"
+#include "gpu_params.glsl"
+#include "util.glsl"
+#include "postprocess/tonemapping_utils.glsl"
+
+#include "setup_iterative_pt.glsl"
+
+layout(local_size_x=WORKGROUP_SIZE_X, local_size_y=WORKGROUP_SIZE_Y) in;
+#include "setup_pixel_assignment.glsl"
+
+layout(binding = FRAMEBUFFER_BIND_POINT, set = 0, rgba8) uniform writeonly image2D framebuffer;
+layout(binding = ACCUMBUFFER_BIND_POINT, set = 0, rgba32f) uniform image2D accum_buffer;
+#ifdef ATOMIC_ACCUMULATE_ADD
+layout(binding = ATOMIC_ACCUMBUFFER_BIND_POINT, set = 0, r32f) uniform volatile image2DArray atomic_accum_buffer;
+#else
+layout(binding = ATOMIC_ACCUMBUFFER_BIND_POINT, set = 0, r32ui) uniform volatile uimage2DArray atomic_accum_buffer;
+#endif
+#ifdef DENOISE_BUFFER_BIND_POINT
+layout(binding = DENOISE_BUFFER_BIND_POINT, set = 0, rgba16f) uniform image2D denoise_buffer;
+#endif
+
+#ifdef ENABLE_AOV_BUFFERS
+    #ifndef REPROJECTION_ACCUM_GBUFFER
+        #define ACCUM_AOV_READONLY readonly
+    #else
+        #define ACCUM_AOV_READONLY
+    #endif
+layout(binding = AOV_ALBEDO_ROUGHNESS_BIND_POINT, set = 0, rgba16f) uniform ACCUM_AOV_READONLY image2D aov_albedo_roughness_buffer;
+layout(binding = AOV_NORMAL_DEPTH_BIND_POINT, set = 0, rgba16f) uniform ACCUM_AOV_READONLY image2D aov_normal_depth_buffer;
+layout(binding = AOV_MOTION_JITTER_BIND_POINT, set = 0, rgba16f) uniform readonly image2D aov_motion_jitter_buffer;
+#endif
+
+layout(binding = HISTORY_BUFFER_BIND_POINT, set = 0) uniform sampler2D history_buffer;
+#ifdef ENABLE_REALTIME_RESOLVE
+layout(binding = HISTORY_AOV_BUFFER_BIND_POINT, set = 0) uniform sampler2D history_normal_depth_buffer;
+#ifdef REPROJECTION_ACCUM_GBUFFER
+layout(binding = HISTORY_AOV_BUFFER_BIND_POINT+1, set = 0) uniform sampler2D history_aov2_buffer;
+#endif
+#endif
+
+layout(binding = VIEW_PARAMS_BIND_POINT, set = 0, std140) uniform VPBuf {
+    LOCAL_CONSTANT_PARAMETERS
+};
+layout(binding = SCENE_PARAMS_BIND_POINT, set = 0, std140) uniform GPBuf {
+    GLOBAL_CONSTANT_PARAMETERS
+};
+
+layout(push_constant) uniform PushConstants {
+    PUSH_CONSTANT_PARAMETERS
+};
+
+#ifdef ENABLE_REALTIME_RESOLVE
+#define REPROJECTION_MOTION_JITTER_BUFFER aov_motion_jitter_buffer
+#define REPROJECTION_ACCUM_HISTORY history_buffer
+#define REPROJECTION_NORMAL_DEPTH_HISTORY history_normal_depth_buffer
+#define REPROJECTION_AOV2_HISTORY history_aov2_buffer
+#define REPROJECTION_ACCUM_TARGET accum_buffer
+#define REPROJECTION_ACCUM_NORMAL_DEPTH_TARGET aov_normal_depth_buffer
+#define REPROJECTION_ACCUM_AOV2_TARGET aov_albedo_roughness_buffer
+#include "postprocess/reprojection.glsl"
+#endif
+
+void main() {
+    int sample_base_index = accumulation_frame_offset;
+    int sample_batch_size = accumulation_batch_size;
+
+    ivec2 fb_pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 fb_dims = ivec2(view_params.frame_dims);
+    if (fb_pixel.x >= fb_dims.x || fb_pixel.y >= fb_dims.y)
+        return;
+
+    vec4 accum_color;
+#ifdef ATOMIC_ACCUMULATE
+    if ((accumulation_flags & ACCUMULATION_FLAGS_ATOMIC) != 0) {
+        UNROLL_FOR (int c = 0; c < 4; ++c)
+            accum_color[c] =
+#ifndef ATOMIC_ACCUMULATE_ADD
+                uintBitsToFloat
+#endif
+                ( imageLoad(atomic_accum_buffer, ivec3(fb_pixel, c)).x );
+#ifdef ATOMIC_ACCUMULATE_ADD
+        accum_color /= float(sample_base_index + sample_batch_size);
+#endif
+#ifdef PRE_EXPOSE_IMAGES
+        // apply exposure directly for screen-calibrated effects, denoisers etc.
+        if (accum_color.w >= 0.0f)
+            accum_color.xyz *= exp2(render_params.exposure);
+#endif
+    }
+    else
+#endif
+    {
+        accum_color = imageLoad(accum_buffer, fb_pixel);
+#ifdef PRE_EXPOSE_IMAGES
+        // apply exposure directly for screen-calibrated effects, denoisers etc.
+        if (accum_color.w >= 0.0f)
+            accum_color.xyz *= exp2(render_params.exposure);
+#endif
+
+#ifdef ENABLE_REALTIME_RESOLVE
+        if (sample_base_index > 0 && render_params.reprojection_mode == REPROJECTION_MODE_ACCUMULATE) {
+            accum_color = reproject_and_accumulate(accum_color, fb_pixel, fb_dims
+                , 1.0f / float(render_params.spp_accumulation_window)
+                , sample_base_index, sample_batch_size
+                , render_params.exposure, render_params.focus_distance);
+        }
+        else
+#endif
+        {
+            if (sample_base_index > 0 &&
+#ifdef ENABLE_REALTIME_RESOLVE
+                render_params.reprojection_mode == REPROJECTION_MODE_NONE
+#else
+                render_params.reprojection_mode != REPROJECTION_MODE_DISCARD_HISTORY
+#endif
+            ) {
+                vec2 point = (vec2(fb_pixel) + vec2(0.5f)) / vec2(fb_dims);
+
+                vec4 history_color = textureLod(history_buffer, point, 0.0f);
+                history_color += (accum_color - history_color) / float(sample_base_index + sample_batch_size);
+
+                accum_color = history_color;
+            }
+
+            imageStore(accum_buffer, fb_pixel, accum_color);
+        }
+    }
+
+    accum_color.a = min(accum_color.a, 1.0f);
+    imageStore(denoise_buffer, fb_pixel, accum_color);
+
+    // The debug renderer sets alpha to -1 to skip the below processing.
+    if (!(accum_color.w >= 0.0f))
+        return;
+
+#if !defined(ENABLE_POST_PROCESSING) && !defined(PRE_EXPOSE_IMAGES)
+    if (render_params.output_channel == OUTPUT_CHANNEL_COLOR)
+        accum_color.xyz *= exp2(render_params.exposure);
+#endif
+
+    // If we don't have the uber post pass, we need to do the exposure and tonemapping here.
+    if (render_params.output_channel == OUTPUT_CHANNEL_COLOR && render_params.early_tone_mapping_mode >= 0)
+        accum_color.xyz = tonemap(render_params.early_tone_mapping_mode, accum_color.xyz);
+#ifdef ENABLE_AOV_BUFFERS
+    else if (render_params.output_channel == OUTPUT_CHANNEL_ALBEDO_ROUGHNESS) {
+        accum_color = imageLoad(aov_albedo_roughness_buffer, fb_pixel);
+        if (render_params.output_moment != 0)
+            accum_color.xyz = accum_color.www;
+    }
+    else if (render_params.output_channel == OUTPUT_CHANNEL_NORMAL_DEPTH) {
+        accum_color = imageLoad(aov_normal_depth_buffer, fb_pixel);
+        if (render_params.output_moment != 0)
+            accum_color.xyz = accum_color.www * 0.05f;
+        else
+            accum_color.xyz = accum_color.xyz * 0.5f + vec3(0.5f);
+    }
+    else if (render_params.output_channel == OUTPUT_CHANNEL_MOTION_JITTER) {
+        if (render_params.output_moment == 0) {
+            vec2 motion = imageLoad(aov_motion_jitter_buffer, fb_pixel).xy;
+            //motion = abs((vec2(fb_pixel.x, fb_pixel.y) + vec2(0.5f)) / vec2(fb_dims) - vec2(0.5f) - 0.5f * motion) * 10.f;
+            motion = abs(10.0f * motion);
+            accum_color = vec4(motion, 0.f, 1.f);
+        }
+        else {
+            vec2 jitter = imageLoad(aov_motion_jitter_buffer, fb_pixel).zw;
+            // Reverse transformation applied during sampling, see render_vulkan.cpp
+            jitter += 1.0f / vec2(view_params.frame_dims);
+            jitter *= vec2(view_params.frame_dims) / 2.0f;
+            accum_color = vec4(jitter * vec2(0.5f) + vec2(0.5f), 0.f, 1.f);
+        }
+    }
+#else
+    else if (render_params.output_channel == OUTPUT_CHANNEL_NORMAL_DEPTH) {
+        if (render_params.output_moment != 0)
+            accum_color.xyz = vec3(length(accum_color.xyz));
+        else
+            accum_color.xyz = accum_color.xyz * 0.5f + vec3(0.5f);
+    }
+    else if (render_params.output_channel == OUTPUT_CHANNEL_MOTION_JITTER) {
+        accum_color.xyz = (accum_color.xyz - view_params.cam_pos.xyz) * 0.1f + vec3(0.5f);
+    }
+#endif
+
+    accum_color.xyz = vec3(linear_to_srgb(accum_color.x), linear_to_srgb(accum_color.y), linear_to_srgb(accum_color.z));
+
+    if (render_params.render_upscale_factor == 2) {
+        imageStore(framebuffer, 2 * fb_pixel, accum_color);
+        imageStore(framebuffer, 2 * fb_pixel + ivec2(0, 1), accum_color);
+        imageStore(framebuffer, 2 * fb_pixel + ivec2(1, 0), accum_color);
+        imageStore(framebuffer, 2 * fb_pixel + ivec2(1, 1), accum_color);
+    }
+    else
+        imageStore(framebuffer, fb_pixel, accum_color);
+}

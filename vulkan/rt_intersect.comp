@@ -1,0 +1,68 @@
+// Copyright 2023 Intel Corporation.
+// SPDX-License-Identifier: MIT
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "language.glsl"
+#include "gpu_params.glsl"
+#include "defaults.glsl"
+
+#extension GL_EXT_ray_query : require
+
+layout(binding = SCENE_BIND_POINT, set = 0) uniform accelerationStructureEXT scene;
+
+layout(binding = RAYQUERIES_BIND_POINT, set = QUERY_BIND_SET, std430) buffer RayQueryBuf {
+    RenderRayQuery ray_queries[];
+};
+layout(binding = RAYRESULTS_BIND_POINT, set = QUERY_BIND_SET, std430) buffer RayResultsBuf {
+    vec4 ray_results[];
+};
+
+layout(push_constant) uniform PushConstants {
+    int num_rayqueries;
+    int _pad1;
+    int _pad2;
+    int _pad3;
+};
+
+layout(local_size_x=WORKGROUP_SIZE_X, local_size_y=WORKGROUP_SIZE_Y) in;
+
+void main() {
+    uint query_id = gl_LocalInvocationIndex +
+        + (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+    if (query_id >= uint(num_rayqueries))
+        return;
+
+    vec3 ray_origin = ray_queries[query_id].origin;
+    int mode = ray_queries[query_id].mode_or_data;
+    vec3 ray_dir = ray_queries[query_id].dir;
+    float t_min = RAY_EPSILON * length(ray_origin);
+    float t_max = ray_queries[query_id].t_max;
+
+    if (mode < 0)
+        return;
+
+    rayQueryEXT rayQuery;
+    rayQueryInitializeEXT(rayQuery, scene, gl_RayFlagsOpaqueEXT, 0xff,
+        ray_origin, t_min, ray_dir, t_max);
+    while (rayQueryProceedEXT(rayQuery)) {
+        rayQueryConfirmIntersectionEXT(rayQuery);
+    }
+
+    vec4 ray_result;
+    if (rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+        ray_result = vec4(-1.0f, -1.0f, intBitsToFloat(ivec2(-1, -1)));
+    } else {
+        vec2 attrib = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+        // float dist = rayQueryGetIntersectionTEXT(rayQuery, true);
+        int instanceIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
+        int geometryIdx = rayQueryGetIntersectionGeometryIndexEXT(rayQuery, true);
+        int primitiveIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
+
+        ray_result = vec4(attrib
+            , intBitsToFloat(ivec2(instanceIdx + geometryIdx, primitiveIdx))
+            );
+    }
+    ray_results[query_id] = ray_result;
+}

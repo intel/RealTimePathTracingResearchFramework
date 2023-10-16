@@ -1,0 +1,137 @@
+// Copyright 2023 Intel Corporation.
+// SPDX-License-Identifier: MIT
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "language.glsl"
+#include "gpu_params.glsl"
+#include "defaults.glsl"
+#include "util.glsl"
+
+#extension GL_EXT_ray_query : require
+
+layout(binding = SCENE_BIND_POINT, set = 0) uniform accelerationStructureEXT scene;
+
+layout(push_constant) uniform PushConstants {
+    PUSH_CONSTANT_PARAMETERS
+};
+
+layout(binding = VIEW_PARAMS_BIND_POINT, set = 0, std140) uniform VPBuf {
+    LOCAL_CONSTANT_PARAMETERS
+};
+layout(binding = SCENE_PARAMS_BIND_POINT, set = 0, std140) uniform GPBuf {
+    GLOBAL_CONSTANT_PARAMETERS
+};
+
+layout(binding = RAYQUERIES_BIND_POINT, set = QUERY_BIND_SET, std430) buffer RayQueryBuf {
+    RenderRayQuery ray_queries[];
+};
+layout(binding = RAYRESULTS_BIND_POINT, set = QUERY_BIND_SET, std430) buffer RayResultsBuf {
+    vec4 ray_results[];
+};
+
+layout(binding = FRAMEBUFFER_BIND_POINT, set = 0, rgba8) uniform writeonly image2D framebuffer;
+layout(binding = ACCUMBUFFER_BIND_POINT, set = 0, rgba32f) uniform image2D accum_buffer;
+
+layout(local_size_x=WORKGROUP_SIZE_X, local_size_y=WORKGROUP_SIZE_Y) in;
+#include "setup_pixel_assignment.glsl"
+
+// Copyright 2019 Google LLC.
+// SPDX-License-Identifier: Apache-2.0
+
+// Polynomial approximation in GLSL for the Turbo colormap
+// Original LUT: https://gist.github.com/mikhailov-work/ee72ba4191942acecc03fe6da94fc73f
+
+// Authors:
+//   Colormap Design: Anton Mikhailov (mikhailov@google.com)
+//   GLSL Approximation: Ruofei Du (ruofei@google.com)
+
+vec3 TurboColormap(in float x) {
+  const vec4 kRedVec4 = vec4(0.13572138, 4.61539260, -42.66032258, 132.13108234);
+  const vec4 kGreenVec4 = vec4(0.09140261, 2.19418839, 4.84296658, -14.18503333);
+  const vec4 kBlueVec4 = vec4(0.10667330, 12.64194608, -60.58204836, 110.36276771);
+  const vec2 kRedVec2 = vec2(-152.94239396, 59.28637943);
+  const vec2 kGreenVec2 = vec2(4.27729857, 2.82956604);
+  const vec2 kBlueVec2 = vec2(-89.90310912, 27.34824973);
+
+  x = clamp(x, 0.0f, 1.0f);
+  vec4 v4 = vec4( 1.0, x, x * x, x * x * x);
+  vec2 v2 = v4.zw * v4.z;
+  return vec3(
+    dot(v4, kRedVec4)   + dot(v2, kRedVec2),
+    dot(v4, kGreenVec4) + dot(v2, kGreenVec2),
+    dot(v4, kBlueVec4)  + dot(v2, kBlueVec2)
+  );
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const vec2 dims = view_params.frame_dims;
+    const vec2 point = (vec2(pixel) + vec2(0.5f)) / dims;
+   
+    vec3 ray_origin = view_params.cam_pos.xyz;
+    vec3 ray_dir = normalize(point.x * view_params.cam_du.xyz + point.y * view_params.cam_dv.xyz + view_params.cam_dir_top_left.xyz);
+    float t_min = 0;
+    float t_max = 2.e32f;
+
+    int intersectCounts = 0;
+
+    uint traversal_flags = gl_RayFlagsOpaqueEXT;
+    if (render_params.output_moment == 1)
+        traversal_flags = 0;
+    uint count_candidate_type = gl_RayQueryCandidateIntersectionTriangleEXT;
+    if (render_params.output_channel == 1)
+        count_candidate_type = gl_RayQueryCandidateIntersectionAABBEXT;
+
+    rayQueryEXT rayQuery;
+    rayQueryInitializeEXT(rayQuery, scene, traversal_flags, 0xff,
+        ray_origin, t_min, ray_dir, t_max);
+    while (rayQueryProceedEXT(rayQuery)) {
+        if (count_candidate_type == rayQueryGetIntersectionTypeEXT(rayQuery, false))
+            ++intersectCounts;
+        rayQueryConfirmIntersectionEXT(rayQuery);
+    }
+
+    vec4 ray_result = vec4(0.0f);
+    if (rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+        vec2 attrib = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+        // float dist = rayQueryGetIntersectionTEXT(rayQuery, true);
+        int instanceIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
+        int geometryIdx = rayQueryGetIntersectionGeometryIndexEXT(rayQuery, true);
+        int primitiveIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
+
+        if (render_params.output_moment == 1) {
+            ray_result = vec4(intersectCounts);
+        }
+        else {
+            if (render_params.output_channel == 0)
+                ray_result = vec4(primitiveIdx);
+            else if (render_params.output_channel == 1)
+                ray_result = vec4(instanceIdx + geometryIdx);
+            else if (render_params.output_channel == 2)
+                ray_result = vec4(instanceIdx);
+        }
+    }
+
+    if (point.x < 1.0f && point.y < 1.0f) {
+        vec4 accum_color = ray_result;
+        if (render_params.output_moment == 1) {
+            if (accum_color.x > 0.999f && accum_color.x < 4.001f)
+                accum_color.xyz = vec3(1.0f - (accum_color.x - 1.0f) / 3.0f);
+            else
+                accum_color.xyz = TurboColormap((accum_color.x - 4.0f) / 10.0f);
+        }
+        else if (render_params.output_channel <= 2) {
+            //vec3 denom = vec3(512.0f, 8.0f*512.0f, 64.0f * 512.0f);
+            //vec3 denom = vec3(1000.0f, 1000.0f, 1000.0f);
+            vec3 denom = vec3(32.0f, 1024.0f, 32.0f * 1024.0f);
+            accum_color.xyz = mod(accum_color.xyz, denom) / denom;
+        }
+
+        // Alpha -1 triggers an early out in process_samples.comp
+        imageStore(accum_buffer, pixel, vec4(accum_color.xyz, -1.0f));
+        accum_color.xyz = vec3(linear_to_srgb(accum_color.x), linear_to_srgb(accum_color.y), linear_to_srgb(accum_color.z));
+        imageStore(framebuffer, pixel, accum_color);
+    }
+}

@@ -1,48 +1,56 @@
+// Copyright 2023 Intel Corporation.
+// SPDX-License-Identifier: MIT
+
 #include "gldisplay.h"
+#include "render_graphic.h"
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include "imgui_impl_opengl3.h"
-#include "imgui_impl_sdl.h"
+#include <GLFW/glfw3.h>
+#include "backends/imgui_impl_opengl3.h"
+#include "imgui_backend.h"
 
-const std::string fullscreen_quad_vs = R"(
-#version 330 core
+const std::string fullscreen_quad_vs =
+  "#version 330 core\n"
+  "\n"
+  "const vec4 pos[4] = vec4[4](\n"
+  "	vec4(-1, 1, 0.5, 1),\n"
+  "	vec4(-1, -1, 0.5, 1),\n"
+  "	vec4(1, 1, 0.5, 1),\n"
+  "	vec4(1, -1, 0.5, 1)\n"
+  ");\n"
+  "\n"
+  "void main(void){\n"
+  "	gl_Position = pos[gl_VertexID];\n"
+  "}\n";
 
-const vec4 pos[4] = vec4[4](
-	vec4(-1, 1, 0.5, 1),
-	vec4(-1, -1, 0.5, 1),
-	vec4(1, 1, 0.5, 1),
-	vec4(1, -1, 0.5, 1)
-);
+const std::string display_texture_fs =
+  "#version 330 core\n"
+  "\n"
+  "uniform sampler2D img;\n"
+  "\n"
+  "out vec4 color;\n"
+  "\n"
+  "void main(void){\n"
+  "	ivec2 uv = ivec2(gl_FragCoord.x, textureSize(img, 0).y - gl_FragCoord.y);\n"
+  "	color = texelFetch(img, uv, 0);\n"
+  "}\n";
 
-void main(void){
-	gl_Position = pos[gl_VertexID];
+
+Display* create_opengl_display(GLFWwindow *window, const char *device_override) {
+    return new GLDisplay(window);
 }
-)";
 
-const std::string display_texture_fs = R"(
-#version 330 core
-
-uniform sampler2D img;
-
-out vec4 color;
-
-void main(void){ 
-	ivec2 uv = ivec2(gl_FragCoord.x, textureSize(img, 0).y - gl_FragCoord.y);
-	color = texelFetch(img, uv, 0);
-})";
-
-GLDisplay::GLDisplay(SDL_Window *win)
-    : window(win), gl_context(SDL_GL_CreateContext(win)), render_texture(-1)
+GLDisplay::GLDisplay(GLFWwindow *win)
+    : window(win), render_texture(-1)
 {
-    SDL_GL_SetSwapInterval(1);
-    SDL_GL_MakeCurrent(window, gl_context);
+    glfwMakeContextCurrent(window);
 
     if (!gladLoadGL()) {
         throw std::runtime_error("Failed to initialize OpenGL");
     }
 
-    ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330 core");
 
     display_render = std::make_unique<Shader>(fullscreen_quad_vs, display_texture_fs);
@@ -57,29 +65,28 @@ GLDisplay::GLDisplay(SDL_Window *win)
 GLDisplay::~GLDisplay()
 {
     glDeleteVertexArrays(1, &vao);
-    if (render_texture != -1) {
+    if (render_texture != GLuint(-1)) {
         glDeleteTextures(1, &render_texture);
     }
     ImGui_ImplOpenGL3_Shutdown();
-    SDL_GL_DeleteContext(gl_context);
 }
 
-std::string GLDisplay::gpu_brand()
+std::string GLDisplay::gpu_brand() const
 {
     return reinterpret_cast<const char *>(glGetString(GL_RENDERER));
 }
 
-std::string GLDisplay::name()
+std::string GLDisplay::name() const
 {
     return "OpenGL";
 }
 
 void GLDisplay::resize(const int fb_width, const int fb_height)
 {
-    fb_dims = glm::uvec2(fb_width, fb_height);
-    if (render_texture != -1) {
+    if (render_texture != GLuint(-1)) {
         glDeleteTextures(1, &render_texture);
     }
+    this->fb_dims = glm::ivec2(fb_width, fb_height);
     glGenTextures(1, &render_texture);
     glBindTexture(GL_TEXTURE_2D, render_texture);
     glTexImage2D(GL_TEXTURE_2D,
@@ -98,9 +105,13 @@ void GLDisplay::resize(const int fb_width, const int fb_height)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 }
 
-void GLDisplay::new_frame()
+void GLDisplay::init_ui_frame()
 {
     ImGui_ImplOpenGL3_NewFrame();
+}
+
+void GLDisplay::new_frame()
+{
 }
 
 void GLDisplay::display(const std::vector<uint32_t> &img)
@@ -124,5 +135,24 @@ void GLDisplay::display_native(const GLuint img)
 
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-    SDL_GL_SwapWindow(window);
+    glfwSwapBuffers(window);
+}
+
+void Display::display(RenderGraphic *renderer) {
+    const glm::uvec3 fbSize = renderer->get_framebuffer_size();
+    assert(fbSize.z == sizeof(uint32_t));
+    framebuffer.resize(fbSize.x * static_cast<size_t>(fbSize.y));
+    bool available = framebuffer.size() == renderer->readback_framebuffer(
+        framebuffer.size() * sizeof(uint32_t),
+        reinterpret_cast<unsigned char*>(framebuffer.data()));
+    assert(available);
+    (void) available;
+    return display(framebuffer);
+}
+
+void GLDisplay::display(RenderGraphic *renderer) {
+    if (auto* render_gl = dynamic_cast<RenderGLGraphic*>(renderer))
+        return display_native(render_gl->display_texture);
+    else
+        return Display::display(renderer);
 }

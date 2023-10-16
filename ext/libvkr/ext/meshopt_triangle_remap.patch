@@ -1,0 +1,62 @@
+diff --git a/src/meshoptimizer.h b/src/meshoptimizer.h
+index f94dbaf..e941a90 100644
+--- a/src/meshoptimizer.h
++++ b/src/meshoptimizer.h
+@@ -142,7 +142,7 @@ MESHOPTIMIZER_API void meshopt_generateTessellationIndexBuffer(unsigned int* des
+  *
+  * destination must contain enough space for the resulting index buffer (index_count elements)
+  */
+-MESHOPTIMIZER_API void meshopt_optimizeVertexCache(unsigned int* destination, const unsigned int* indices, size_t index_count, size_t vertex_count);
++MESHOPTIMIZER_API void meshopt_optimizeVertexCache(unsigned int* destination, unsigned int *remap, const unsigned int* indices, size_t index_count, size_t vertex_count);
+ 
+ /**
+  * Vertex transform cache optimizer for strip-like caches
+@@ -151,7 +151,7 @@ MESHOPTIMIZER_API void meshopt_optimizeVertexCache(unsigned int* destination, co
+  *
+  * destination must contain enough space for the resulting index buffer (index_count elements)
+  */
+-MESHOPTIMIZER_API void meshopt_optimizeVertexCacheStrip(unsigned int* destination, const unsigned int* indices, size_t index_count, size_t vertex_count);
++MESHOPTIMIZER_API void meshopt_optimizeVertexCacheStrip(unsigned int* destination, unsigned int *remap, const unsigned int* indices, size_t index_count, size_t vertex_count);
+ 
+ /**
+  * Vertex transform cache optimizer for FIFO caches
+diff --git a/src/vcacheoptimizer.cpp b/src/vcacheoptimizer.cpp
+index fb8ade4..63e5612 100644
+--- a/src/vcacheoptimizer.cpp
++++ b/src/vcacheoptimizer.cpp
+@@ -166,7 +166,7 @@ static unsigned int getNextTriangleDeadEnd(unsigned int& input_cursor, const uns
+ 
+ } // namespace meshopt
+ 
+-void meshopt_optimizeVertexCacheTable(unsigned int* destination, const unsigned int* indices, size_t index_count, size_t vertex_count, const meshopt::VertexScoreTable* table)
++void meshopt_optimizeVertexCacheTable(unsigned int* destination, unsigned int *remap, const unsigned int* indices, size_t index_count, size_t vertex_count, const meshopt::VertexScoreTable* table)
+ {
+ 	using namespace meshopt;
+ 
+@@ -243,6 +243,7 @@ void meshopt_optimizeVertexCacheTable(unsigned int* destination, const unsigned
+ 		destination[output_triangle * 3 + 0] = a;
+ 		destination[output_triangle * 3 + 1] = b;
+ 		destination[output_triangle * 3 + 2] = c;
++		remap[output_triangle] = current_triangle;
+ 		output_triangle++;
+ 
+ 		// update emitted flags
+@@ -348,14 +349,14 @@ void meshopt_optimizeVertexCacheTable(unsigned int* destination, const unsigned
+ 	assert(output_triangle == face_count);
+ }
+ 
+-void meshopt_optimizeVertexCache(unsigned int* destination, const unsigned int* indices, size_t index_count, size_t vertex_count)
++void meshopt_optimizeVertexCache(unsigned int* destination, unsigned int *remap, const unsigned int* indices, size_t index_count, size_t vertex_count)
+ {
+-	meshopt_optimizeVertexCacheTable(destination, indices, index_count, vertex_count, &meshopt::kVertexScoreTable);
++	meshopt_optimizeVertexCacheTable(destination, remap, indices, index_count, vertex_count, &meshopt::kVertexScoreTable);
+ }
+ 
+-void meshopt_optimizeVertexCacheStrip(unsigned int* destination, const unsigned int* indices, size_t index_count, size_t vertex_count)
++void meshopt_optimizeVertexCacheStrip(unsigned int* destination, unsigned int *remap, const unsigned int* indices, size_t index_count, size_t vertex_count)
+ {
+-	meshopt_optimizeVertexCacheTable(destination, indices, index_count, vertex_count, &meshopt::kVertexScoreTableStrip);
++	meshopt_optimizeVertexCacheTable(destination, remap, indices, index_count, vertex_count, &meshopt::kVertexScoreTableStrip);
+ }
+ 
+ void meshopt_optimizeVertexCacheFifo(unsigned int* destination, const unsigned int* indices, size_t index_count, size_t vertex_count, unsigned int cache_size)

@@ -1,0 +1,57 @@
+// Copyright 2023 Intel Corporation.
+// SPDX-License-Identifier: MIT
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "language.glsl"
+#include "../gpu_params.glsl"
+
+layout(local_size_x=WORKGROUP_SIZE_X, local_size_y=WORKGROUP_SIZE_Y) in;
+
+layout(binding = ACCUMBUFFER_BIND_POINT, set = 0, rgba32f) uniform image2D accum_buffer;
+
+layout(binding = VIEW_PARAMS_BIND_POINT, set = 0, std140) uniform CBuf {
+    LOCAL_CONSTANT_PARAMETERS
+};
+
+// todo: internal test only, remove
+vec4 test_background(in vec2 I, float iTime)
+{
+	vec2 p = vec2(2.*I.x-1., -2.*I.y+1.) * vec2(view_params.frame_dims.xy) / float(view_params.frame_dims.y);
+    float y = .2*smoothstep(0.,-.5,p.y);
+    p = .0123*p + vec2(-1.156,.2735);
+    vec2 a=p*0.;
+    for (int i = 0; i < 30; i++)
+    {
+        float angle = 0.0001f * float(i) * cos(3.7f * iTime);
+        mat2 r = mat2(cos(angle), sin(angle), -sin(angle), cos(angle));
+        a = r * a;
+        //a.y += 0.01f * exp2(-float(i)) * cos(iTime);
+        a += vec2(a.x*a.x-a.y*a.y,2.*a.x*a.y) + p;
+        
+    }
+    float f = step(length(a),4.);
+    vec4 o = vec4(f*vec2(0.55f + 0.45f * cos(a.x + 0.433f * iTime),sin(a.y + 1.3 * iTime)),a.x*f+y, 1.);
+    return max(o, 0.f);
+}
+
+void main() {
+    ivec2 fb_pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 fb_dims = ivec2(view_params.frame_dims);
+    if (fb_pixel.x >= fb_dims.x || fb_pixel.y >= fb_dims.y)
+        return;
+
+    vec4 pixel = imageLoad(accum_buffer, fb_pixel);
+
+    pixel.xyz *= pixel.xyz;
+    pixel.xyz *= 0.5f * vec3(0.7f, 0.3f, 0.1f);
+    pixel.xyz = mix(vec3(0.1, 0.005, 0.0), pixel.xyz, 0.9f - 0.9f * vec2(fb_pixel).y / vec2(view_params.frame_dims).y);
+
+    if (pixel.a >= 0.0f && pixel.a < 1.0f) {
+        vec4 background = test_background(vec2(fb_pixel) / vec2(view_params.frame_dims), view_params.time);
+        pixel.xyz = mix(background.xyz, pixel.xyz, pixel.a);
+    }
+
+    imageStore(accum_buffer, fb_pixel, pixel);
+}

@@ -1,14 +1,19 @@
+// Copyright 2023 Intel Corporation.
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include <string>
-#include <unordered_map>
+#include "unordered_vector.hpp"
 #include "glad/glad.h"
 
 struct Shader {
     GLuint program;
-    std::unordered_map<std::string, GLint> uniforms;
+    unordered_vector<std::string, GLint> uniforms;
 
     Shader(const std::string &vert_src, const std::string &frag_src);
+    Shader(const Shader &) = delete;
+    Shader& operator=(const Shader &) = delete;
     ~Shader();
     template <typename T>
     void uniform(const std::string &unif, const T &t);

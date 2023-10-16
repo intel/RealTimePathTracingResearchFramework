@@ -1,0 +1,38 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21
+  },
+  "configurePresets": [
+    {
+      "name": "vulkan",
+      "description": "Build framework for vulkan.",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "ENABLE_VULKAN": "ON",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "vulkan_debug",
+      "description": "Build framework for vulkan in debug mode.",
+      "inherits": "vulkan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vulkan",
+      "configurePreset": "vulkan",
+      "configuration": "Release"
+    },
+    {
+      "name": "vulkan_debug",
+      "configurePreset": "vulkan_debug",
+      "configuration": "Debug"
+    }
+  ]
+}

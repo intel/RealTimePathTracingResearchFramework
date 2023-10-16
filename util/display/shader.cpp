@@ -1,3 +1,6 @@
+// Copyright 2023 Intel Corporation.
+// SPDX-License-Identifier: MIT
+
 #include "shader.h"
 #include <algorithm>
 #include <fstream>
@@ -124,7 +127,7 @@ GLint compile_shader(GLenum type, const std::string &src)
         default:
             std::cout << "Unknown shader type: ";
         }
-        GLint len;
+        GLint len = 0;
         glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &len);
         std::vector<char> log(len, '\0');
         log.resize(len);

@@ -1,0 +1,11 @@
+// Copyright 2023 Intel Corporation.
+// SPDX-License-Identifier: MIT
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#ifdef USE_RT_PIPELINE
+#pragma shader_stage(raygen)
+#endif
+
+#include "pt_megakernel.glsl"

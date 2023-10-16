@@ -1,238 +1,493 @@
+// Copyright 2023 Intel Corporation.
+// SPDX-License-Identifier: MIT
+
 #version 460
+#extension GL_GOOGLE_include_directive : require
 
-#include "util.glsl"
-#include "lcg_rng.glsl"
-#include "lights.glsl"
-#include "disney_bsdf.glsl"
-#include "util/texture_channel_mask.h"
+#extension GL_EXT_ray_tracing : require
 
-struct MaterialParams {
-    vec3 base_color;
-    float metallic;
+#include "language.glsl"
+#include "gpu_params.glsl"
 
-    float specular;
-    float roughness;
-    float specular_tint;
-    float anisotropy;
+// Available test feature flags:
+// #define SOBOL_NO_SCRAMBLE
+// #define Z_ORDER_SHUFFLING
+#define ENABLE_RAYQUERIES
 
-    float sheen;
-    float sheen_tint;
-    float clearcoat;
-    float clearcoat_gloss;
+// Not supported for now:
+#undef ENABLE_AOV_BUFFERS
 
-    float ior;
-    float specular_transmission;
-    vec2 pad;
+#include "pathspace.h"
+
+#define MAKE_RANDOM_TABLE(TYPE, NAME) \
+layout(binding = RANDOM_NUMBERS_BIND_POINT, set = 0, std430) buffer RNBuf {\
+    TYPE NAME;\
+};
+#include "pointsets/selected_rng.glsl"
+
+#include "setup_iterative_pt.glsl"
+#include "bsdfs/hit_point.glsl"
+
+#include "rt/materials.glsl"
+#include "bsdfs/gltf_bsdf.glsl"
+
+#include "lights/tri.glsl"
+
+layout(binding = SCENE_BIND_POINT, set = 0) uniform accelerationStructureEXT scene;
+
+layout(binding = FRAMEBUFFER_BIND_POINT, set = 0, rgba8) uniform writeonly image2D framebuffer;
+#include "accumulate.glsl"
+
+layout(binding = VIEW_PARAMS_BIND_POINT, set = 0, std140) uniform VPBuf {
+    LOCAL_CONSTANT_PARAMETERS
+};
+layout(binding = SCENE_PARAMS_BIND_POINT, set = 0, std140) uniform GPBuf {
+    GLOBAL_CONSTANT_PARAMETERS
 };
 
-layout(binding = 0, set = 0) uniform accelerationStructureEXT scene;
-layout(binding = 1, set = 0, rgba8) uniform writeonly image2D framebuffer;
-layout(binding = 2, set = 0, rgba32f) uniform image2D accum_buffer;
-
-layout(binding = 3, set = 0, std140) uniform ViewParams {
-    vec4 cam_pos;
-    vec4 cam_du;
-    vec4 cam_dv;
-    vec4 cam_dir_top_left;
-    int frame_id;
+layout(binding = MATERIALS_BIND_POINT, set = 0, scalar) buffer MaterialParamsBuffer {
+    MATERIAL_PARAMS material_params[];
 };
 
-layout(binding = 4, set = 0, scalar) buffer MaterialParamsBuffer {
-    MaterialParams material_params[];
+layout(binding = LIGHTS_BIND_POINT, set = 0, std430) buffer LightParamsBuffer {
+    TriLightData global_lights[];
 };
 
-layout(binding = 5, set = 0, std430) buffer LightParamsBuffer {
-    QuadLight lights[];
+#ifdef ENABLE_RAYQUERIES
+layout(binding = RAYQUERIES_BIND_POINT, set = QUERY_BIND_SET, std430) buffer RayQueryBuf {
+    RenderRayQuery ray_queries[];
 };
-
+#endif
 #ifdef REPORT_RAY_STATS
-layout(binding = 6, set = 0, r16ui) uniform writeonly uimage2D ray_stats;
+layout(binding = RAYSTATS_BIND_POINT, set = QUERY_BIND_SET, r16ui) uniform writeonly uimage2D ray_stats;
 #endif
 
-layout(binding = 0, set = 1) uniform sampler2D textures[];
+layout(binding = 0, set = TEXTURE_BIND_SET) uniform sampler2D textures[];
+#ifdef STANDARD_TEXTURE_BIND_SET
+layout(binding = 0, set = STANDARD_TEXTURE_BIND_SET) uniform sampler2D standard_textures[];
+#endif
 
 layout(location = PRIMARY_RAY) rayPayloadEXT RayPayload payload;
-layout(location = OCCLUSION_RAY) rayPayloadEXT bool occlusion_hit;
+layout(location = OCCLUSION_RAY) rayPayloadEXT int occlusion_hit;
 
 layout(shaderRecordEXT) buffer SBT {
-    uint32_t num_lights;
+    uint32_t backend_variant_index;
 };
 
-float textured_scalar_param(const float x, in const vec2 uv) {
-    const uint32_t mask = floatBitsToUint(x);
-    if (IS_TEXTURED_PARAM(mask) != 0) {
-        const uint32_t tex_id = GET_TEXTURE_ID(mask);
-        const uint32_t channel = GET_TEXTURE_CHANNEL(mask);
-        return texture(textures[nonuniformEXT(tex_id)], uv)[channel];
+layout(push_constant) uniform PushConstants {
+    PUSH_CONSTANT_PARAMETERS
+};
+
+// assemble light transport algorithm
+#define SCENE_GET_TEXTURE(tex_id) textures[nonuniformEXT(tex_id)]
+#define SCENE_GET_STANDARD_TEXTURE(tex_id) standard_textures[nonuniformEXT(tex_id)]
+
+#define SCENE_GET_LIGHT_SOURCE(light_id) decode_tri_light(global_lights[nonuniformEXT(light_id)])
+#define SCENE_GET_LIGHT_SOURCE_COUNT()   int(scene_params.light_sampling.light_count)
+
+#define BINNED_LIGHTS_BIN_SIZE int(view_params.light_sampling.bin_size)
+#define SCENE_GET_BINNED_LIGHTS_BIN_COUNT() (int(scene_params.light_sampling.light_count + (view_params.light_sampling.bin_size - 1)) / int(view_params.light_sampling.bin_size))
+
+#include "rt/material_textures.glsl"
+#include "mc/nee.glsl"
+
+#include "geometry.glsl"
+
+float geometry_scale = 0.0f;
+uint ray_count = 0;
+uint rayMask = 0xff;
+
+
+bool raytrace_test_visibility(const vec3 from, const vec3 dir, float dist) {
+  const uint32_t occlusion_flags = gl_RayFlagsTerminateOnFirstHitEXT
+      | gl_RayFlagsSkipClosestHitShaderEXT;
+
+    occlusion_hit = 1;
+    float epsilon = geometry_scale_to_tmin(from, geometry_scale);
+    if (dist - 2.f * epsilon > 0.0f) {
+        traceRayEXT(scene, occlusion_flags, rayMask,
+                PRIMARY_RAY, 1, OCCLUSION_RAY, from, epsilon, dir, dist - epsilon, OCCLUSION_RAY);
+#ifdef REPORT_RAY_STATS
+        ++ray_count;
+#endif
     }
-    return x;
+    return occlusion_hit == 0;
 }
 
-void unpack_material(inout DisneyMaterial mat, uint id, vec2 uv) {
-	MaterialParams p = material_params[nonuniformEXT(id)];
-
-    const uint32_t mask = floatBitsToUint(p.base_color.x);
-    if (IS_TEXTURED_PARAM(mask) != 0) {
-        const uint32_t tex_id = GET_TEXTURE_ID(mask);
-        const uint32_t channel = GET_TEXTURE_CHANNEL(mask);
-        mat.base_color = texture(textures[nonuniformEXT(tex_id)], uv).rgb;
-    } else {
-		mat.base_color = p.base_color;
-	}
-
-    mat.metallic = textured_scalar_param(p.metallic, uv);
-    mat.specular = textured_scalar_param(p.specular, uv);
-    mat.roughness = textured_scalar_param(p.roughness, uv);
-    mat.specular_tint = textured_scalar_param(p.specular_tint, uv);
-    mat.anisotropy = textured_scalar_param(p.anisotropy, uv);
-    mat.sheen = textured_scalar_param(p.sheen, uv);
-    mat.sheen_tint = textured_scalar_param(p.sheen_tint, uv);
-    mat.clearcoat = textured_scalar_param(p.clearcoat, uv);
-    mat.clearcoat_gloss = textured_scalar_param(p.clearcoat_gloss, uv);
-    mat.ior = textured_scalar_param(p.ior, uv);
-    mat.specular_transmission = textured_scalar_param(p.specular_transmission, uv);
-}
-
-vec3 sample_direct_light(in const DisneyMaterial mat, in const vec3 hit_p, in const vec3 n,
-	in const vec3 v_x, in const vec3 v_y, in const vec3 w_o, inout uint ray_count, inout LCGRand rng)
-{
-	vec3 illum = vec3(0.f);
-
-	uint32_t light_id = uint32_t(lcg_randomf(rng) * num_lights);
-	light_id = min(light_id, num_lights - 1);
-	QuadLight light = lights[nonuniformEXT(light_id)];
-
-    const uint32_t occlusion_flags = gl_RayFlagsOpaqueEXT
-        | gl_RayFlagsTerminateOnFirstHitEXT
-        | gl_RayFlagsSkipClosestHitShaderEXT;
-
-	// Sample the light to compute an incident light ray to this point
-	{
-		vec3 light_pos = sample_quad_light_position(light,
-                vec2(lcg_randomf(rng), lcg_randomf(rng)));
-		vec3 light_dir = light_pos - hit_p;
-		float light_dist = length(light_dir);
-		light_dir = normalize(light_dir);
-
-		float light_pdf = quad_light_pdf(light, light_pos, hit_p, light_dir);
-		float bsdf_pdf = disney_pdf(mat, n, w_o, light_dir, v_x, v_y);
-
-        occlusion_hit = true;
-        traceRayEXT(scene, occlusion_flags, 0xff,
-                PRIMARY_RAY, 1, OCCLUSION_RAY, hit_p, EPSILON, light_dir, light_dist, OCCLUSION_RAY);
-#ifdef REPORT_RAY_STATS
-		++ray_count;
-#endif
-		if (light_pdf >= EPSILON && bsdf_pdf >= EPSILON && !occlusion_hit) {
-			vec3 bsdf = disney_brdf(mat, n, w_o, light_dir, v_x, v_y);
-			float w = power_heuristic(1.f, light_pdf, 1.f, bsdf_pdf);
-			illum = bsdf * light.emission.rgb * abs(dot(light_dir, n)) * w / light_pdf;
-		}
-	}
-
-	// Sample the BRDF to compute a light sample as well
-	{
-		vec3 w_i;
-		float bsdf_pdf;
-		vec3 bsdf = sample_disney_brdf(mat, n, w_o, v_x, v_y, rng, w_i, bsdf_pdf);
-		
-		float light_dist;
-		vec3 light_pos;
-		if (any(greaterThan(bsdf, vec3(0.f))) && bsdf_pdf >= EPSILON
-			&& quad_intersect(light, hit_p, w_i, light_dist, light_pos))
-		{
-			float light_pdf = quad_light_pdf(light, light_pos, hit_p, w_i);
-			if (light_pdf >= EPSILON) {
-				float w = power_heuristic(1.f, bsdf_pdf, 1.f, light_pdf);
-                occlusion_hit = true;
-                traceRayEXT(scene, occlusion_flags, 0xff,
-                        PRIMARY_RAY, 1, OCCLUSION_RAY, hit_p, EPSILON, w_i, light_dist, OCCLUSION_RAY);
-#ifdef REPORT_RAY_STATS
-				++ray_count;
-#endif
-				if (!occlusion_hit) {
-					illum += bsdf * light.emission.rgb * abs(dot(w_i, n)) * w / bsdf_pdf;
-				}
-			}
-		}
-	}
-	return illum;
-}
-
+void main_spp(uint sample_index, uint rnd_offset);
 void main() {
-    const ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
-    const vec2 dims = vec2(gl_LaunchSizeEXT.xy);
-    LCGRand rng = get_rng(frame_id);
-    vec2 d = (pixel + vec2(lcg_randomf(rng), lcg_randomf(rng))) / dims;
+#ifdef ENABLE_RAYQUERIES
+    // note: this forbids any warp-wide collaborative work
+    if (num_rayqueries > 0) {
+        uint query_id = gl_LaunchSizeEXT.x * gl_LaunchIDEXT.y + gl_LaunchIDEXT.x;
+        if (query_id >= uint(num_rayqueries))
+            return;
+    }
+#endif
 
-    vec3 ray_origin = cam_pos.xyz;
-    vec3 ray_dir = normalize(d.x * cam_du.xyz + d.y * cam_dv.xyz + cam_dir_top_left.xyz);
+    uint sample_batch_offset = accumulation_frame_offset >= 0 ? uint(accumulation_frame_offset) : view_params.frame_id;
+    uint sample_index = sample_batch_offset + gl_LaunchSizeEXT.z;
+    main_spp(sample_index, view_params.frame_offset);
+}
+
+void main_spp(uint sample_index, uint rnd_offset) {
+    ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    const vec2 dims = view_params.frame_dims;
+ 
+    RANDOM_STATE rng = GET_RNG(sample_index, rnd_offset, uvec4(gl_LaunchIDEXT.xy, view_params.frame_dims.xy));
+
+    vec2 d = vec2(pixel.x + 0.5f, pixel.y + 0.5f);
+    if (render_params.enable_raster_taa == 0)
+        d += SAMPLE_PIXEL_FILTER(RANDOM_FLOAT2(rng, DIM_PIXEL_X));
+    d /= dims;
+    if (render_params.enable_raster_taa != 0)
+        d += 0.5f * view_params.screen_jitter;
+
+    vec3 ray_origin = view_params.cam_pos.xyz;
+    vec3 ray_dir = normalize(d.x * view_params.cam_du.xyz + d.y * view_params.cam_dv.xyz + view_params.cam_dir_top_left.xyz);
     float t_min = 0;
     float t_max = 1e20f;
 
-    DisneyMaterial mat;
+    if (render_params.aperture_radius > 0.0f) {
+        vec3 focus = ray_origin + render_params.focus_distance * ray_dir;
+        vec2 r2 = RANDOM_FLOAT2(rng, DIM_APERTURE_X);
+        //r2 = r2 * 2.0f - vec2(1.0f);
+        r2 = vec2(cos(2.0f * M_PI * r2.x), sin(2.0f * M_PI * r2.x)) * sqrt(r2.y);
+        r2 *= render_params.aperture_radius;
+        ray_origin += r2.x * normalize(view_params.cam_du.xyz);
+        ray_origin += r2.y * normalize(view_params.cam_dv.xyz);
+        ray_dir = normalize(focus - ray_origin);
+    }
 
-	uint ray_count = 0;
-	int bounce = 0;
-	vec3 illum = vec3(0.f);
-	vec3 path_throughput = vec3(1.f);
-    do {
-        traceRayEXT(scene, gl_RayFlagsOpaqueEXT, 0xff, PRIMARY_RAY, 1, PRIMARY_RAY,
-                ray_origin, t_min, ray_dir, t_max, PRIMARY_RAY);
-#ifdef REPORT_RAY_STATS
-		++ray_count;
+#ifdef ENABLE_RAYQUERIES
+    if (num_rayqueries > 0) {
+        uint query_id = gl_LaunchSizeEXT.x * gl_LaunchIDEXT.y + gl_LaunchIDEXT.x;
+        ray_origin = ray_queries[query_id].origin;
+        ray_dir = ray_queries[query_id].dir;
+        t_max = ray_queries[query_id].t_max;
+    }
 #endif
+
+    // update random state
+    RANDOM_SET_DIM(rng, DIM_CAMERA_END);
+    
+    float camera_footprint = 0.0f, transport_footprint = 0.0f;
+#ifdef TRANSPORT_NORMALFRAME
+    vec4 pathspace_frame = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+#endif
+#if defined(USE_MIPMAPPING) || defined(TRANSPORT_MIPMAPPING) || defined(TRANSPORT_ROUGHENING)
+    vec3 dpdx, dpdy;
+    float total_t = 0.0f;
+    {
+#else
+    {  
+        vec3 dpdx, dpdy;
+#endif
+        dpdx = view_params.cam_du.xyz / dims.x;
+        dpdy = view_params.cam_dv.xyz / dims.y;
+        // footprint for which we estimate and control the variance of averages
+        camera_footprint += (render_params.variance_radius * render_params.variance_radius) * length(cross(dpdx, dpdy));
+        // mipmapping/prefiltering footprint
+        dpdx *= render_params.pixel_radius;
+        dpdy *= render_params.pixel_radius;
+    }
+#ifdef TRANSPORT_RELIABILITY
+    float total_reliability = 0.0f;
+#endif
+
+    int bounce = 0, realBounce = 0;
+    vec3 illum = vec3(0.f);
+    vec3 path_throughput = vec3(1.f);
+    // data for emitter MIS
+    vec3 prev_wo = vec3(-ray_dir);
+    vec3 prev_n = ray_dir;
+    float prev_bsdf_pdf = 2.0e16f;
+
+
+    do {
+        const uint32_t occlusionFlags = 0;
+        traceRayEXT(scene, occlusionFlags, 0xff, PRIMARY_RAY, 1, PRIMARY_RAY,
+                ray_origin, t_min, ray_dir, t_max, PRIMARY_RAY);
+
+#ifdef REPORT_RAY_STATS
+        ++ray_count;
+#endif
+
+        if (bounce == 0 && render_params.aperture_radius > 0.0f) {
+            float acfp = render_params.aperture_radius * render_params.aperture_radius * M_PI;
+            float focus_g = render_params.focus_distance * render_params.focus_distance;
+            acfp /= focus_g;
+            float dof_dist = abs(payload.dist - render_params.focus_distance);
+            transport_footprint += acfp * (dof_dist * dof_dist / focus_g);
+        }
+
         // If we hit nothing, include the scene background color from the miss shader
         if (payload.dist < 0.f) {
-            illum += path_throughput * payload.normal.rgb;
+            if (render_params.output_channel != 0)
+                break;
+            illum += path_throughput * abs(payload.normal);
+            {
+                NEEQueryPoint query;
+                query.point = ray_origin;
+                query.normal = prev_n;
+                query.w_o = prev_wo;
+                query.info = NEEQueryInfo(0);
+#ifndef PT_DISABLE_NEE
+                float light_pdf = eval_direct_sun_light_pdf(query, ray_dir);
+                float w = nee_mis_heuristic(1.f, prev_bsdf_pdf, 1.f, light_pdf);
+#else
+                float w = 1.0f;
+#endif
+                illum += w * path_throughput * abs(payload.geo_normal);
+            }
             break;
         }
 
-		const vec3 w_o = -ray_dir;
-		const vec3 hit_p = ray_origin + payload.dist * ray_dir;
-		unpack_material(mat, payload.material_id, payload.uv);
 
-		vec3 v_x, v_y;
-		vec3 v_z = payload.normal;
-		// For opaque objects (or in the future, thin ones) make the normal face forward
-		if (mat.specular_transmission == 0.f && dot(w_o, v_z) < 0.0) {
-			v_z = -v_z;
-		}
-		ortho_basis(v_x, v_y, v_z);
+        float approx_tri_solid_angle = length(payload.geo_normal);
+        payload.geo_normal /= approx_tri_solid_angle;
+        approx_tri_solid_angle *= abs(dot(payload.geo_normal, ray_dir)) / (payload.dist * payload.dist);
 
-		illum += path_throughput * sample_direct_light(mat, hit_p, v_z, v_x, v_y, w_o, ray_count, rng);
+#ifdef USE_MIPMAPPING
+        mat2 duvdxy;
+        {
+            total_t += payload.dist;
+            vec3 dir_tangent_un = ray_dir - payload.geo_normal * dot(ray_dir, payload.geo_normal);
+            float cosTheta2 = max(1.0f - dot(dir_tangent_un, dir_tangent_un), 0.0f);
+            vec3 dir_tangent_elong = dir_tangent_un / (sqrt(cosTheta2) + cosTheta2);
+            vec3 bitangent = payload.bitangent_l * cross(payload.geo_normal, normalize(payload.tangent));
+            // GLSL non-square matrix order seems broken
+            vec3 dpdx_ = dpdx + dir_tangent_elong * dot(dpdx, dir_tangent_un);
+            vec3 dpdy_ = dpdy + dir_tangent_elong * dot(dpdy, dir_tangent_un);
+#ifdef TRANSPORT_MIPMAPPING
+            dpdx_ = normalize(dpdx_) * sqrt(length2(dpdx_) + transport_footprint);
+            dpdy_ = normalize(dpdy_) * sqrt(length2(dpdy_) + transport_footprint);
+#endif
+            duvdxy = mat2x2(
+                    dot(payload.tangent, dpdx_), dot(bitangent, dpdx_),
+                    dot(payload.tangent, dpdy_), dot(bitangent, dpdy_)
+                ) * total_t;
+        }
+        geometry_scale = total_t;
+#else
+        mat2 duvdxy = mat2(0.0f);
+#endif
 
-		vec3 w_i;
-		float pdf;
-		vec3 bsdf = sample_disney_brdf(mat, v_z, w_o, v_x, v_y, rng, w_i, pdf);
-		if (pdf == 0.f || all(equal(bsdf, vec3(0.f)))) {
-			break;
-		}
-		path_throughput *= bsdf * abs(dot(w_i, v_z)) / pdf;
+        vec3 w_o = -ray_dir;
+        InteractionPoint interaction;
+        interaction.p = ray_origin + payload.dist * ray_dir;
 
-		ray_origin = hit_p;
-		ray_dir = w_i;
-		t_min = EPSILON;
-		t_max = 1e20f;
-		++bounce;
+        MATERIAL_TYPE mat;
+        EmitterParams emit;
+        float material_alpha = unpack_material(mat, emit
+            , payload.material_id, material_params[nonuniformEXT(payload.material_id)]
+            , HitPoint(interaction.p, payload.uv, duvdxy, vec3(0.0)));
+        vec3 scatter_throughput = path_throughput;
 
-        // Russian roulette termination
-        if (bounce > 3) {
-            const float q = max(0.05f, 1.f - max(path_throughput.x, max(path_throughput.y, path_throughput.z)));
-            if (lcg_randomf(rng) < q) {
+        // direct emitter hit
+        if (render_params.output_channel == 0 && emit.radiance != vec3(0.0f))
+        {
+#ifndef PT_DISABLE_NEE
+            float light_pdf;
+            if (view_params.light_sampling.light_mis_angle > 0.0f)
+                light_pdf = 1.0f / view_params.light_sampling.light_mis_angle;
+            else
+                light_pdf = wpdf_direct_tri_light(approx_tri_solid_angle);
+            float w = nee_mis_heuristic(1.f, prev_bsdf_pdf, 1.f, light_pdf);
+#else
+            float w = 1.0f;
+#endif
+            illum += w * scatter_throughput * emit.radiance;
+        }
+
+#ifdef TRANSPORT_ROUGHENING
+        {
+            float matAlpha = mat.roughness * mat.roughness;
+            float transportSpreadNrm = transport_footprint / (render_params.variance_radius * render_params.variance_radius); // + camera_footprint: do not include camera footprint for now, roughness was specified for direct visibility after all
+            float roughenedAlpha = min(sqrt(max(matAlpha * matAlpha, transportSpreadNrm / 2.0f * M_1_PI)), 1.0f);
+            mat.roughness = sqrt(roughenedAlpha);
+        }
+#endif
+
+        interaction.gn = payload.geo_normal;
+        interaction.n = payload.normal;
+        // For opaque objects (or in the future, thin ones) make the normal face forward
+        if ((mat.flags & BASE_MATERIAL_ONESIDED) == 0 && dot(w_o, interaction.gn) < 0.0) {
+            interaction.n = -interaction.n;
+            interaction.gn = -interaction.gn;
+        }
+
+        // apply normal mapping
+        int normal_map = material_params[nonuniformEXT(payload.material_id)].normal_map;
+        if (normal_map != -1) {
+            vec3 v_y = normalize( cross(payload.normal, payload.tangent) );
+            vec3 v_x = cross(v_y, payload.normal);
+            v_x *= length(payload.tangent);
+            v_y *= payload.bitangent_l;
+
+#ifdef USE_MIPMAPPING
+            // for now, reduce normal resolution with bounces (current representation not really filterable)
+            float normal_lod = float(bounce);
+#else
+            float normal_lod = 0.0f;
+#endif
+            vec3 map_nrm = textureLod(get_standard_texture_sampler(normal_map, payload.material_id, STANDARD_TEXTURE_NORMAL_SLOT), payload.uv, normal_lod).rgb;
+            map_nrm = vec3(2.0f, 2.0f, 1.0f) * map_nrm - vec3(1.0f, 1.0f, 0.0f);
+            // Z encoding might be unclear, just reconstruct
+            map_nrm.z = sqrt(max(1.0f - map_nrm.x * map_nrm.x - map_nrm.y * map_nrm.y, 0.0f));
+            mat3 iT_shframe = mat3(v_x, v_y, scene_params.normal_z_scale * interaction.n);
+            interaction.n = normalize(iT_shframe * map_nrm);
+        }
+
+        // fix incident directions under geo hemisphere
+        {
+            float nw = dot(w_o, interaction.n);
+            float gnw = dot(w_o, interaction.gn);
+            if (nw * gnw <= 0.0f) {
+                float blend = gnw / (gnw - nw);
+                interaction.n = normalize( mix(interaction.gn, interaction.n, blend - EPSILON) );
+            }
+        }
+        
+        interaction.v_y = normalize( cross(interaction.n, payload.tangent) );
+        interaction.v_x = cross(interaction.v_y, interaction.n);
+
+#ifndef PT_DISABLE_NEE
+        if (render_params.output_channel == 0 && bounce+1 < MAX_PATH_DEPTH) {
+
+            // first two dimensions light position selection, last light selection (sky/direct)
+            vec4 nee_rng_sample = vec4(RANDOM_FLOAT2(rng, DIM_POSITION_X), RANDOM_FLOAT2(rng, DIM_LIGHT_SEL_1));
+            NEEQueryAux nee_aux;
+            nee_aux.mis_pdf = view_params.light_sampling.light_mis_angle > 0.0f ? 1.0f / view_params.light_sampling.light_mis_angle : 0.0f;
+            illum += scatter_throughput * sample_direct_light(mat, interaction, w_o, nee_rng_sample.xy, nee_rng_sample.zw, nee_aux);
+
+        }
+#endif
+        RANDOM_SHIFT_DIM(rng, DIM_LIGHT_END);
+
+        if (render_params.output_channel != 0) {
+
+            float reliability = 1.0f;
+#ifdef TRANSPORT_RELIABILITY
+            reliability = camera_footprint / (camera_footprint + transport_footprint);
+            //total_reliability += reliability;
+            total_reliability = (1.0f - reliability) * total_reliability + reliability;
+#endif
+            illum *= 1.0f - reliability;
+            if (render_params.output_channel == 1)
+                illum += scatter_throughput * mat.base_color * reliability;
+            else if (render_params.output_channel == 2) {
+                vec3 pathspace_normal = interaction.n;
+#ifdef TRANSPORT_NORMALFRAME
+                pathspace_normal = quat_rot(pathspace_frame, pathspace_normal);
+                if (pathspace_frame.w < 0.0f) // reflection encoded in sign bit of w compoonent!
+                    pathspace_normal = -pathspace_normal;
+#endif
+                illum += pathspace_normal * reliability;
+            }
+            else if (render_params.output_channel == 3) {
+                illum += interaction.p * reliability;
+            }
+        }
+
+        {
+            vec3 w_i;
+            float sampling_pdf, mis_wpdf;
+            vec3 bsdf = sample_bsdf(mat, interaction, w_o, w_i, sampling_pdf, mis_wpdf
+                , RANDOM_FLOAT2(rng, DIM_DIRECTION_X), RANDOM_FLOAT2(rng, DIM_LOBE), rng);
+            RANDOM_SHIFT_DIM(rng, DIM_VERTEX_END);
+            // Must increment before the break statement below or the alpha channel
+            // will be accumulated incorrectly.
+            ++bounce;
+            if (mis_wpdf == 0.f || bsdf == vec3(0.f) || !(dot(w_i, interaction.n) * dot(w_i, interaction.gn) > 0.0f)) {
                 break;
             }
-            path_throughput = path_throughput / (1.f - q);
+            path_throughput *= bsdf;
+            transport_footprint += 1.0f / sampling_pdf;
+
+#ifdef TRANSPORT_NORMALFRAME
+            float frame_sign = sign(pathspace_frame.w);
+            vec4 frame_change = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+#endif
+            if (dot(w_i, interaction.n) * dot(w_o, interaction.n) >= 0.0f) {
+#ifdef USE_MIPMAPPING
+            vec3 hr = normalize(w_i + w_o);
+            dpdx = reflect(dpdx, hr);
+            dpdy = reflect(dpdy, hr);
+#ifdef TRANSPORT_NORMALFRAME
+            // chain reflection transformations for path-space gbuffer
+            // rotation:             q1 P q1'
+            // reflection:           q1 P q1      = -q1 P q1'
+            // double rotation:   q2 q1 P q1' q2' =  q2 q1 P (q2 q1)'
+            // double reflection: q2 q1 P q1  q2  =  q2 q1 P (-q1') (-q2') = q2 q1 P (q2 q1)'
+            // => flip sign bit on every reflection
+            frame_change = vec4(hr, 0.0f);
+            frame_sign = -frame_sign;
+#endif
+#endif
+            } else {
+                float cosRefractionAngle = -dot(w_i, w_o);
+                vec3 refractionOrtho = cross(w_i, w_o); // order matters!
+                float cosHalfAngle = sqrt(0.5f + 0.5f * cosRefractionAngle);
+                float sinToSinHalf = 0.5f / cosHalfAngle; // sin theta = 2 * sin(theta/2) * cos(theta/2)
+                vec4 refractionRot = vec4(refractionOrtho * sinToSinHalf, cosHalfAngle);
+#ifdef TRANSPORT_NORMALFRAME
+                frame_change = refractionRot;
+                //illum = 10.0f * (quat_rot(frame_change, -w_o) - w_i);
+                //break;
+#endif
+            }
+#ifdef TRANSPORT_NORMALFRAME
+            pathspace_frame = quat_mul(pathspace_frame, frame_change);
+            pathspace_frame = quat_copysign(pathspace_frame, frame_sign);
+#endif
+
+            prev_wo = w_o;
+            prev_bsdf_pdf = mis_wpdf;
+            prev_n = interaction.n;
+
+            ray_dir = w_i;
         }
-	} while (bounce < MAX_PATH_DEPTH);
+        ray_origin = interaction.p;
+        t_min = geometry_scale_to_tmin(ray_origin, total_t);
+        t_max = 1e20f;
+        ++realBounce;
 
-    vec4 accum_color = imageLoad(accum_buffer, pixel);
-	accum_color = (vec4(illum, 1.0) + frame_id * accum_color) / (frame_id + 1);
-    imageStore(accum_buffer, pixel, accum_color);
+        // Russian roulette termination
+        if (bounce >= render_params.rr_path_depth) {
+            float prefix_weight = max(path_throughput.x, max(path_throughput.y, path_throughput.z));
 
-    accum_color.xyz = vec3(linear_to_srgb(accum_color.x), linear_to_srgb(accum_color.y),
-            linear_to_srgb(accum_color.z));
-    imageStore(framebuffer, pixel, vec4(accum_color.xyz, 1.f));
+            float rr_prob = prefix_weight;
+            if (bounce > 6)
+                rr_prob = min(0.95f, rr_prob); // todo: good?
+            else
+                rr_prob = min(1.0f, rr_prob);
+
+            float rr_sample = RANDOM_FLOAT1(rng, DIM_RR);
+
+            if (rr_sample < rr_prob)
+                path_throughput /= rr_prob;
+            else
+                break;
+        }
+
+        RANDOM_SET_DIM(rng, DIM_CAMERA_END + realBounce * (DIM_VERTEX_END + DIM_LIGHT_END));
+    } while (bounce < render_params.max_path_depth);
+
+    if (render_params.output_channel != 0 && total_reliability > 0.0f) {
+        //illum /= total_reliability;
+    }
+
+    
+    vec4 final_color = vec4(illum, bounce == 0 ? 0.0f : 1.0f);
+#ifdef ENABLE_RAYQUERIES
+    if (num_rayqueries > 0) {
+        uint query_id = gl_LaunchSizeEXT.x * gl_LaunchIDEXT.y + gl_LaunchIDEXT.x;
+        accumulate_query(query_id, final_color, sample_index);
+        return;
+    }
+#endif
+    accumulate(pixel, final_color, sample_index, (accumulation_flags & ACCUMULATION_FLAGS_ATOMIC) != 0);
 
 #ifdef REPORT_RAY_STATS
     imageStore(ray_stats, pixel, uvec4(ray_count));

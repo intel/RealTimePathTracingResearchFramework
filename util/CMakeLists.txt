@@ -1,40 +1,47 @@
+# Copyright 2023 Intel Corporation.
+# SPDX-License-Identifier: MIT
+
+begin_support_targets() # IDE filters
 add_subdirectory(display)
 
+
+
 add_library(util
-    arcball_camera.cpp
+    interactive_camera.cpp
     util.cpp
-    material.cpp
-    mesh.cpp
-    scene.cpp
-    buffer_view.cpp
-    gltf_types.cpp
-    flatten_gltf.cpp
-    file_mapping.cpp)
+    profiling.cpp
+    error_io.cpp
+    file_mapping.cpp
+    device_backend.cpp
+    write_image.cpp
+    image.cpp
+    lod.cpp
+    sha1_bytes.cpp
 
-set_target_properties(util PROPERTIES
-    CXX_STANDARD 14
-    CXX_STANDARD_REQUIRED ON)
+    )
+add_project_files(util ${CMAKE_CURRENT_SOURCE_DIR} *.h)
 
+target_precompile_headers(util PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/../pch.hpp>)
+target_precompile_headers(display REUSE_FROM util)
+
+# make these modules known to all dependent targets
 target_include_directories(util PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/parallel_hashmap>
-    $<BUILD_INTERFACE:${GLM_INCLUDE_DIRS}>)
+    ${GLFW_INTERFACE_DEFINITIONS})
+target_compile_definitions(util PUBLIC ${GLM_INTERFACE_DEFINITIONS})
 
+target_link_libraries(util PUBLIC glm)
 target_link_libraries(util PUBLIC imgui)
+target_link_libraries(util PUBLIC tinyexr)
+target_link_libraries(util PUBLIC stb)
+target_link_libraries(util PRIVATE crypto-algorithms)
+#target_link_libraries(util PRIVATE parallel_hashmap json tiny_gltf)
 
-if (TARGET SDL2::SDL2)
-    target_link_libraries(util PUBLIC
-        SDL2::SDL2
-        SDL2::SDL2main)
-else ()
-    target_include_directories(util PUBLIC
-        $<BUILD_INTERFACE:${SDL2_INCLUDE_DIRS}>)
-    target_link_libraries(util PUBLIC ${SDL2_LIBRARIES})
-endif( )
 
-find_package(pbrtParser)
-if (${pbrtParser_FOUND})
-    target_link_libraries(util PUBLIC pbrtParser)
-    target_compile_definitions(util PUBLIC PBRT_PARSER_ENABLED)
-endif()
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+add_executable(compare_exr compare_exr.cpp)
+target_link_libraries(compare_exr PRIVATE util tinyexr)
 
+# IDE filters
+end_support_targets()
+set_main_targets(util)

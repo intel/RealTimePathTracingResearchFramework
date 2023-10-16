@@ -1,109 +1,180 @@
-cmake_minimum_required(VERSION 3.5)
-project(chameleonrt)
+# Copyright 2023 Intel Corporation.
+# SPDX-License-Identifier: MIT
 
-if (NOT WIN32)
-	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")
+cmake_minimum_required(VERSION 3.16)
+
+# ------------------------------------------------------------------------------
+# Available configurations
+# ------------------------------------------------------------------------------
+
+include(CMakeDependentOption)
+
+option(ENABLE_VULKAN "Build the Vulkan rendering backend. Requires Vulkan." ON)
+
+if (NOT WIN32 OR CMAKE_BUILD_TYPE MATCHES "Release|RELEASE|RelWithDebInfo|RELWITHDEBINFO")
+    option(ENABLE_PYTHON "Enable modules for Python integration" ON)
+else ()
+    # todo: this should not be necessary, but cannot expect python dev environment by default?
+    option(ENABLE_PYTHON "Enable modules for Python integration" OFF)
+endif ()
+
+option(FORCE_COLORED_OUTPUT "Always produce ANSI-colored output (GNU/Clang only)." ${UNIX})
+
+# todo: some of these have become optimizations decoupled from target HW, separate these
+option(COMPILING_FOR_DG2 "Enable DG2 extensions and optimizations" ON)
+
+# Optional language integrations (potentially requires additional SDKs, build tools, and higher CMake versions)
+option(ENABLE_CUDA "Build with CUDA support" OFF)
+
+
+set(RASTER_TAA_NUM_SAMPLES 16 CACHE STRING
+    "Number of sample offsets to use with raster TAA.")
+
+# ------------------------------------------------------------------------------
+
+set(CMAKE_CXX_STANDARD 20) # For filesystem (17) + designated initializers (20)
+get_property(_available_cxx_features GLOBAL PROPERTY CMAKE_CXX_KNOWN_FEATURES)
+if ("${_available_cxx_features}" MATCHES "cxx_std_20")
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+else ()
+    message(WARNING "No full C++20 compatibility indicated, compiling with non-standard extensions."
+        "Available feaures: ${_available_cxx_features}")
+endif ()
+set(PROJECT_LANGUAGES C CXX)
+
+if (ENABLE_CUDA)
+    list(APPEND PROJECT_LANGUAGES CUDA)
+    set(CMAKE_CUDA_STANDARD 14) # todo: maximum supported currently?
+    #set(CMAKE_CUDA_RUNTIME_LIBRARY Static CACHE INTERNAL "Statically link against selected CUDA runtime" FORCE)
+endif ()
+
+# ------------------------------------------------------------------------------
+
+project(rptr ${PROJECT_LANGUAGES})
+
+if (COMPILING_FOR_DG2)
+    add_compile_definitions(COMPILING_FOR_DG2)
 endif()
 
-add_definitions(-DNOMINMAX -DGLM_ENABLE_EXPERIMENTAL -DSDL_MAIN_HANDLED
-    -DWIN32_LEAN_AND_MEAN)
+if (${FORCE_COLORED_OUTPUT})
+    if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+        add_compile_options($<$<COMPILE_LANG_AND_ID:CXX,GNU>:-fdiagnostics-color=always>)
+    elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+        add_compile_options($<$<COMPILE_LANG_AND_ID:CXX,Clang>:-fcolor-diagnostics>)
+    endif ()
+endif ()
+
+if (MSVC)
+	#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ") # /std:c++latest now set by CXX standard below
+else ()
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic -Wno-unused-parameter")
+	if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|CLANG")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-gnu-zero-variadic-macro-arguments")
+    endif ()
+    if (CMAKE_BUILD_TYPE MATCHES "Debug|DEBUG")
+		add_definitions(-D_DEBUG)
+	endif ()
+endif()
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_LIST_DIR}/cmake")
 
 find_package(Threads REQUIRED)
-find_package(glm REQUIRED)
-find_package(SDL2 CONFIG REQUIRED)
-
-add_subdirectory(imgui)
-add_subdirectory(util)
-
-option(ENABLE_OSPRAY "Build the OSPRay rendering backend. Requires OSPRay" OFF)
-option(ENABLE_EMBREE "Build the Embree + TBB + ISPC rendering backend. Requires Embree, TBB and ISPC" OFF)
-
-include(CMakeDependentOption)
-
-cmake_dependent_option(ENABLE_OPTIX "Build the OptiX rendering backend. Requires OptiX and CUDA" OFF
-    "NOT APPLE" OFF)
-
-cmake_dependent_option(ENABLE_VULKAN "Build the Vulkan rendering backend. Requires Vulkan" OFF
-    "NOT APPLE" OFF)
-
-cmake_dependent_option(ENABLE_DXR "Build the DXR rendering backend" OFF
-    "WIN32" OFF)
-
-cmake_dependent_option(ENABLE_METAL "Build the Metal rendering backend" OFF
-    "APPLE" OFF)
-
-option(REPORT_RAY_STATS "Track and report rays/second. May incur a slight rendering performance penalty" OFF)
-
-if (ENABLE_OSPRAY)
-	add_definitions(-DENABLE_OSPRAY)
-	add_subdirectory(ospray)
-endif()
-
-if (ENABLE_EMBREE)
-	add_definitions(-DENABLE_EMBREE)
-	add_subdirectory(embree)
-endif()
-
-if (ENABLE_OPTIX)
-    add_definitions(-DENABLE_OPTIX)
-    add_subdirectory(optix)
-endif()
 
 if (ENABLE_VULKAN)
+    find_package(Vulkan REQUIRED)
     add_definitions(-DENABLE_VULKAN)
-    add_subdirectory(vulkan)
+    add_definitions(-DRASTER_TAA_NUM_SAMPLES=${RASTER_TAA_NUM_SAMPLES})
 endif()
 
-if (ENABLE_DXR)
-    add_definitions(-DENABLE_DXR)
-    add_subdirectory(dxr)
-endif()
 
-if (ENABLE_METAL)
-    add_definitions(-DENABLE_METAL)
-    add_subdirectory(metal)
-endif()
+add_subdirectory(ext)
 
-if (NOT ENABLE_OSPRAY AND NOT ENABLE_EMBREE AND NOT ENABLE_OPTIX
-        AND NOT ENABLE_VULKAN AND NOT ENABLE_DXR AND NOT ENABLE_METAL)
-    message(FATAL_ERROR
-        "At least one backend (OSPRay, Embree, OptiX, Vulkan DXR, Metal) must be selected\n"
-        "Enable at least one of: ENABLE_OSPRAY, ENABLE_EMBREE, ENABLE_OPTIX, ENABLE_VULKAN, ENABLE_DXR, ENABLE_METAL") 
-endif()
+if (WIN32)
+    add_definitions(-DNOMINMAX -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS)
+endif ()
 
-add_executable(chameleonrt main.cpp)
 
-set_target_properties(chameleonrt PROPERTIES
-	CXX_STANDARD 14
-	CXX_STANDARD_REQUIRED ON)
+option(ENABLE_REALTIME_RESOLVE "Enable real-time rendering features such as reprojection" OFF)
+if (ENABLE_REALTIME_RESOLVE)
+    add_compile_definitions(ENABLE_REALTIME_RESOLVE)
+endif ()
 
-target_link_libraries(chameleonrt PUBLIC
-    util
-    display)
+option(ENABLE_PROFILING_TOOLS "Enable profiling tools" OFF)
+if (ENABLE_PROFILING_TOOLS)
+    add_compile_definitions(ENABLE_PROFILING_TOOLS)
+endif ()
 
-if (ENABLE_OSPRAY)
-	target_link_libraries(chameleonrt PUBLIC render_ospray)
-endif()
+option(ENABLE_EXAMPLES "Enable example codes and functions" OFF)
+if (ENABLE_EXAMPLES)
+    add_compile_definitions(ENABLE_EXAMPLES)
+endif ()
 
-if (ENABLE_EMBREE)
-	target_link_libraries(chameleonrt PUBLIC render_embree)
-endif()
+option(ENABLE_DEBUG_VIEWS "Enable debug views" OFF)
+if (ENABLE_DEBUG_VIEWS)
+    add_compile_definitions(ENABLE_DEBUG_VIEWS)
+endif ()
 
-if (ENABLE_OPTIX)
-	target_link_libraries(chameleonrt PUBLIC render_optix)
-endif()
+option(ENABLE_RESTIR "Enable ReStir" OFF)
+if (ENABLE_RESTIR)
+    add_compile_definitions(ENABLE_RESTIR)
+endif ()
+
+include(scripts/ide_project_tools.cmake)
+add_subdirectory(util)
+add_subdirectory(librender)
+
+get_property(CMAKE_GENERATOR_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if (CMAKE_GENERATOR_IS_MULTI_CONFIG)
+    set(PROJECT_BINARY_PRODUCTS_DIR ${PROJECT_BINARY_DIR}/${CMAKE_CFG_INTDIR})
+else ()
+    set(PROJECT_BINARY_PRODUCTS_DIR ${PROJECT_BINARY_DIR})
+endif ()
+include(rendering/gpu_programs.cmake)
+
+# Add module root directory to all dependent modules
+target_include_directories(util INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/unstable>)
+
+add_library(render_backends INTERFACE)
 
 if (ENABLE_VULKAN)
-	target_link_libraries(chameleonrt PUBLIC render_vulkan)
+    add_subdirectory(vulkan)
+    target_link_libraries(render_backends INTERFACE render_vulkan)
 endif()
 
-if (ENABLE_DXR)
-	target_link_libraries(chameleonrt PUBLIC render_dxr)
-endif()
 
-if (ENABLE_METAL)
-    target_link_libraries(chameleonrt PUBLIC render_metal)
-endif()
+if (ENABLE_CUDA)
+    add_definitions(-DENABLE_CUDA)
+    add_subdirectory(cuda)
+    target_link_libraries(render_backends INTERFACE render_cuda)
+endif ()
 
+add_subdirectory(libapp)
+
+add_executable(rptr imstate.cpp imstate.h main.cpp app.cpp cmdline.cpp)
+target_precompile_headers(rptr REUSE_FROM util)
+target_link_libraries(rptr PUBLIC libapp render_backends)
+
+
+# additional tests and tools
+add_subdirectory(rendering)
+
+# copy required run-time libraries to binary dir
+if (EXT_RUNTIME_LIBRARIES)
+    add_custom_target(copy-runtime-libraries ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${EXT_RUNTIME_LIBRARIES} ${PROJECT_BINARY_PRODUCTS_DIR}
+        DEPENDS ${EXT_RUNTIME_LIBRARIES}
+    )
+    if (EXT_RUNTIME_DEPENDENCIES)
+        add_dependencies(copy-runtime-libraries ${EXT_RUNTIME_DEPENDENCIES})
+    endif ()
+    add_dependencies(rptr copy-runtime-libraries)
+endif ()
+
+# IDE support
+set_target_properties(
+    rptr PROPERTIES
+    VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+set_main_targets(rptr)

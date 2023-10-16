@@ -1,0 +1,202 @@
+// Copyright 2023 Intel Corporation.
+// SPDX-License-Identifier: MIT
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_tracing : require
+
+#include "setup_recursive_pt.glsl"
+#include "../gpu_params.glsl"
+
+#ifdef _DEBUG
+#extension GL_EXT_debug_printf : enable
+#endif
+
+// Available feature flags:
+// #define SHUFFLED_DOUBLE_SOBOL
+// #define SOBOL_NO_SCRAMBLE
+// #define ENABLE_SHADER_CLOCK
+
+#ifdef ENABLE_SHADER_CLOCK
+#extension GL_ARB_shader_clock : require
+#endif
+
+#include "rt/footprint.glsl"
+
+
+layout(binding = SCENE_BIND_POINT, set = 0) uniform accelerationStructureEXT scene;
+
+layout(binding = SCENE_PARAMS_BIND_POINT, set = 0, std140) uniform GPBuf {
+    GLOBAL_CONSTANT_PARAMETERS
+};
+
+#ifdef ENABLE_RAYQUERIES
+layout(binding = RAYQUERIES_BIND_POINT, set = QUERY_BIND_SET, std430) buffer RayQueryBuf {
+    RenderRayQuery ray_queries[];
+};
+#endif
+layout(location = OCCLUSION_RAY) rayPayloadEXT int occlusion_hit;
+layout(location = PRIMARY_RAY) rayPayloadEXT RayPayload payload;
+
+layout(shaderRecordEXT) buffer SBT {
+    uint32_t backend_variant_index;
+};
+
+#define RENDERER_NUM_RAYQUERIES num_rayqueries
+
+#ifdef RETURN_TO_RAYGEN
+#include "../geometry.glsl"
+
+#include "accumulate.glsl"
+#endif
+
+void main_spp(uint sample_index, uint rnd_offset);
+void main() {
+#ifdef ENABLE_RAYQUERIES
+    // note: this forbids any warp-wide collaborative work
+    if (num_rayqueries > 0) {
+        uint query_id = gl_LaunchSizeEXT.x * gl_LaunchIDEXT.y + gl_LaunchIDEXT.x;
+        if (query_id >= uint(num_rayqueries))
+            return;
+    }
+#endif
+
+    uint sample_batch_offset = accumulation_frame_offset >= 0 ? uint(accumulation_frame_offset) : view_params.frame_id;
+    main_spp(sample_batch_offset + gl_LaunchIDEXT.z, view_params.frame_offset);
+}
+
+void main_spp(uint sample_index, uint rnd_offset) {
+    ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    const vec2 dims = view_params.frame_dims;
+ 
+#ifdef ENABLE_SHADER_CLOCK
+    uvec2 timing = clock2x32ARB();
+#endif
+
+#ifdef PROFILER_CLOCK
+    uint64_t start_spp_profiler = PROFILER_CLOCK();
+    uint64_t bsdf_sampling_cycles = 0;
+#endif
+
+    RANDOM_STATE rng = GET_RNG(sample_index, rnd_offset, uvec4(gl_LaunchIDEXT.xy, view_params.frame_dims.xy));
+
+    vec2 d = vec2(pixel.x + 0.5f, pixel.y + 0.5f);
+    if (render_params.enable_raster_taa == 0)
+        d += SAMPLE_PIXEL_FILTER(RANDOM_FLOAT2(rng, DIM_PIXEL_X));
+    d /= dims;
+    if (render_params.enable_raster_taa != 0)
+        d += 0.5f * view_params.screen_jitter;
+
+#ifdef _DEBUG
+    if (gl_LaunchIDEXT.xy == ivec2(0))
+        debugPrintfEXT("Position = %v2f\n", d);
+#endif
+
+    vec3 ray_origin = view_params.cam_pos.xyz;
+    vec3 ray_dir = normalize(d.x * view_params.cam_du.xyz + d.y * view_params.cam_dv.xyz + view_params.cam_dir_top_left.xyz);
+    float t_min = 0;
+    float t_max = 1e20f;
+
+    if (render_params.aperture_radius > 0.0f) {
+        vec3 focus = ray_origin + render_params.focus_distance * ray_dir;
+        vec2 r2 = RANDOM_FLOAT2(rng, DIM_APERTURE_X);
+        //r2 = r2 * 2.0f - vec2(1.0f);
+        r2 = vec2(cos(2.0f * M_PI * r2.x), sin(2.0f * M_PI * r2.x)) * sqrt(r2.y);
+        r2 *= render_params.aperture_radius;
+        ray_origin += r2.x * normalize(view_params.cam_du.xyz);
+        ray_origin += r2.y * normalize(view_params.cam_dv.xyz);
+        ray_dir = normalize(focus - ray_origin);
+    }
+
+    AccumulationLocation acc_location = encode_accumulation_pixel(uvec2(pixel));
+
+#ifdef ENABLE_RAYQUERIES
+    if (num_rayqueries > 0) {
+        uint query_id = gl_LaunchSizeEXT.x * gl_LaunchIDEXT.y + gl_LaunchIDEXT.x;
+        ray_origin = ray_queries[query_id].origin;
+        ray_dir = ray_queries[query_id].dir;
+        t_max = ray_queries[query_id].t_max;
+
+        acc_location = encode_accumulation_index(query_id);
+    }
+#endif
+
+    // update random state
+    RANDOM_SET_DIM(rng, DIM_CAMERA_END);
+    
+    float camera_footprint = 0.0f, transport_footprint = 0.0f;
+#ifdef TRANSPORT_NORMALFRAME
+    vec4 pathspace_frame = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+#endif
+#if defined(USE_MIPMAPPING) || defined(TRANSPORT_ROUGHENING)
+    mat2 texture_footprint;
+    float total_t = 0.0f;
+    {
+#endif
+        vec3 dpdx, dpdy;
+        dpdx = view_params.cam_du.xyz / dims.x;
+        dpdy = view_params.cam_dv.xyz / dims.y;
+        // footprint for which we estimate and control the variance of averages
+        camera_footprint += length(cross(dpdx, dpdy));
+        // mipmapping/prefiltering footprint
+        dpdx *= render_params.pixel_radius;
+        dpdy *= render_params.pixel_radius;
+#if defined(USE_MIPMAPPING)
+        texture_footprint = dpdxy_to_footprint(ray_dir, dpdx, dpdy);
+#endif
+    }
+
+#ifdef REPORT_RAY_STATS
+    // todo: this is not going anywhere currently
+    ++ray_count;
+#endif
+
+    setup_payload(payload);
+    PACK_RNG(rng, payload);
+    //payload.location = acc_location;
+    payload.prev_bsdf_pdf = 2.0e16f;
+#if defined(USE_MIPMAPPING)
+    //payload.dpdxy = encode_dpdxy(dpdx, dpdy, 0.0f);
+    payload.footprint = encode_footprint(texture_footprint, 0.0f);
+#endif
+
+    uint rayMask = 0xFF;
+#if (RBO_lod_technique == LOD_TECHNIQUE_COMPUTE_PRE_PASS) && (RBO_lod_transition == LOD_TRANSITION_STOCHASTIC)
+    const uint NUM_MASK_BITS = 7;
+    rayMask = 1 << int(RANDOM_FLOAT1(rng, 1) * NUM_MASK_BITS);
+    payload.rayMask = rayMask;
+#endif
+
+#ifdef NON_RECURSIVE
+    do {
+#endif
+    uint32_t traversalFlags = 0;
+#ifdef ALPHA_RAY_RESTART
+    traversalFlags |= gl_RayFlagsOpaqueEXT;
+#endif
+
+    traceRayEXT(scene, traversalFlags, rayMask // ... hit mask,
+        , PRIMARY_RAY, 1, PRIMARY_RAY // hit index, default stride, miss index
+        , ray_origin, t_min, ray_dir, t_max
+        , PRIMARY_RAY); // payload index
+
+#ifdef NON_RECURSIVE
+    total_t += payload.t;
+
+    ray_origin += ray_dir * payload.t;
+    ray_dir = payload.next_dir;
+    t_min = geometry_scale_to_tmin(ray_origin, total_t);
+    t_max = 1e20f;
+
+    } while (get_bounce(payload) < render_params.max_path_depth);
+#endif
+
+#ifdef RETURN_TO_RAYGEN
+#ifdef ENABLE_SHADER_CLOCK
+    uint nanoseconds = clock2x32ARB().x - timing.x;
+    float time_ms = float(nanoseconds / 1000) / 1000.0f;
+    payload.illum = vec3(0.08f * time_ms);
+#endif
+   accumulate(~0u, vec4(payload.illum, get_bounce(payload) > 0 ? 1.0f : 0.0f), ~0u);
+#endif
+}
