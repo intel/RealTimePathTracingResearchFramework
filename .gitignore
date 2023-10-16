@@ -1,0 +1,8 @@
+*.swp
+*.raw
+build/
+cmake-build
+cmake-ninja
+.DS_Store
+compile_commands.json
+.cache/
