@@ -1,6 +1,6 @@
 # Real-time Path Tracing Research Framework
 
-Note: This is a public pre-release limited to the core components
+**Note**: This is a public pre-release limited to the core components
 required for reproducing some of our research papers.
 
 <!---
