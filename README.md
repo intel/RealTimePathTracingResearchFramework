@@ -56,7 +56,7 @@ validation layers.
 
 The camera is an free-flight camera that moves around the camera's focal point.
 
-- Use W, A, S, D, Space and Q keys to move
+- Use W, A, S, D, Space and Q keys to move.
 - Speed up/down using the mousewheel. (Two-finger scroll motion on MacBook Pro etc. trackpad.)
 - Click and drag to rotate.
 
